@@ -1,0 +1,260 @@
+---
+title: "PML Prediction Assignment Writeup"
+output: html_document
+---
+
+```{r set-options, echo=FALSE, cache=FALSE}
+# The default 80 column text block output width is too small for web output.
+options(width = 128)
+```
+
+### Synopsis
+
+Devices such as Jawbone Up, Nike FuelBand, and Fitbit enable the collection of large amounts
+of data about personal activity.  These devices are part of the quantified self movement.  With
+these devices people quantify how much of a particular activity they perform, but they rarely
+quantify how well they perform those activities.
+
+In this project (part of the Johns Hopkins University Practical Machine Learning class on
+Coursera) we are working with sensor data collected from 6 individuals that performed a
+specific weight lifting activity.  The collected data is used to train statistical models that
+predict whether an individual has performed the weight lifting activity correctly or not.  For
+additional information about the data and how it was collected please refer to the following
+paper.
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of
+Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201). Proceedings of 4th
+International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM
+SIGCHI, 2013.
+
+#### Analysis Environment
+
+This analysis was last run on `r date()` using [RStudio 0.98.1062](http://www.rstudio.com/) and
+[`r version$version.string`](http://www.r-project.org/).  The following libraries were used.
+
+```{r message=FALSE}
+library(caret)
+library(dplyr)
+```
+
+### Data Processing and Cleaning
+
+The file **pml-training.csv** contains the raw sensor data to be used for training the statistical
+models and performing cross validation.  The file **pml-testing.csv** contains a set of 20 samples
+that will be used with the trained models to predict the associated activity.  The data from this
+file is never used in the training of the models.
+
+The raw files use NA and an empty quoted string to denote NA values.  The files may also contain
+the string **#DIV/0!** which indicates that a computation involving sensor data failed during
+collection.  We treat all of these as NA values.
+
+```{r cache = TRUE}
+pmlFolder = Sys.getenv("PML")
+setwd(pmlFolder)
+
+naValues = c("#DIV/0!", "NA", "")
+
+training <- read.table("pml-training.csv", header=T, sep=",", na.strings=naValues)
+testing <- read.table("pml-testing.csv", header=T, sep=",", na.strings=naValues)
+```
+
+Looking at the data one can see that some of the columns contain values used to label or
+index each sample in the file.  Most of these are of little value for training and prediction
+so we removed them from the test and training sets.  We will keep **num_window** because it
+will be useful for aggregating the data later on.  We also keep **classe** which is the
+variable to be predicted by the models.
+
+```{r cache = TRUE}
+training <- select(training, num_window, classe, roll_belt:magnet_forearm_z)
+testing <- select(testing, num_window, problem_id, roll_belt:magnet_forearm_z)
+```
+
+Looking further at the data one can see that some columns contain a lot of NA values.
+These columns are used to hold descriptive statistics calculated one time for each
+window in the data set.  Colunmns with near zero variance can cause problems when
+training some models so we will remove them from the data sets.  Now we calculate
+the percent of NAs in each column and the total NA count.
+
+```{r cache = TRUE}
+naSummary <- data.frame(pctNAs=apply(training, 2, function(c) sum(is.na(c)) / length(c)),
+                        totalNAs=apply(training, 2, function(c) sum(is.na(c))))
+
+head(naSummary, 20)
+```
+
+Some columns are approxiamtely 98% NA while others contain no NA values.  We table
+the total NA counts to see how the NAs are distributed.
+
+```{r}
+table(naSummary$totalNAs)
+```
+
+So it appears that only about 54 of the original columns are potentially useable for
+training a model (those columns containing no NA values).  We remove the other columns
+from the training and test data sets.
+
+```{r cache = TRUE}
+nearZeroColumns <- row.names(naSummary[naSummary$totalNAs > 0,])
+training = select(training, -one_of(nearZeroColumns))
+testing = select(testing, -one_of(nearZeroColumns))
+```
+
+There are a number of other issues in the data (windows with very few samples, some sensor
+readings appear to be misformatted, etc.), but we are going to ignore those and use aggregation
+to smooth over the rough spots.  The assumption here is that the majority of the data is reasonable
+and these problems will be averaged away when we aggregate the data.
+
+### Data Aggregation and Covariate Creation
+
+Now let's look at the distribution of values in the predicted column to see how many samples
+we have to work with.  There are 5 possible values from **A** to **E** where **A** represents
+sensor samples for the weight lifting action performed correctly.  The other values represent
+the action being performed incorrectly in some way.
+
+```{r}
+table(training$classe)
+```
+
+The test data used to make predictions in the final part of this project consists of 20 different
+samples each taken from a diffrent window.  This means the aggregation that we apply to the training
+data and any covariates that we create must be meaningful when applied to the test data set.
+For example, calculating the standard deviation for each column in each window of the training data
+would give us nice summary values, but they would be useless for prediction.  Applying the same
+transformation to the test data would yield all NA values.  That is, the standard deviation of a single
+value is NA.  Recall that each window in the test set contains one sample (row).
+
+The most useful aggregation (and covariate creation) in this case is to calculate the mean for each
+column in each window of the training data set.  Applying the mean to the test data set columns will
+return the same value (the mean of a column with a single value is the value in the column).  Therefore
+the aggregation essentially leaves the test data as-is.  The aggregations are applied below.
+
+```{r cache = TRUE}
+byNumWindow <- group_by(training, num_window, classe)
+newTraining <- summarise_each(byNumWindow, funs(mean))
+
+byNumWindow <- group_by(testing, num_window, problem_id)
+newTesting <- summarise_each(byNumWindow, funs(mean))
+
+table(newTraining$classe)
+```
+
+We still have a decent distribution of the predicted values.  The next step is to use the
+training data to create a few models and see how they perform.
+
+### Model Creation
+
+First we need to withfold some of the aggregated training data so we can use it to estimate
+the "out of sample errors".  We split off 25% of the samples in the training set to be used
+as a validation test set.  The validation test set is named **classeNewTesting** to distinguish
+it from the test data set loaded earlier.
+
+```{r cache = TRUE}
+set.seed(3433)
+inTrainingSet <- createDataPartition(newTraining$classe, p=3/4, list=F)
+classeNewTraining <- newTraining[inTrainingSet,]
+classeNewTesting <- newTraining[-inTrainingSet,]
+```
+
+Random forest models tend to have good accuracy for training data like the kind we have in this
+project.  We train a random forrest model using 5 repetitions of 10-fold cross validation to improve
+overall accuracy.  The training process will search for the best model over various values of the
+**mtry** tuning parameter.  This parameter controls the number of randomly selected predictors.
+
+```{r cache = TRUE, message=FALSE}
+set.seed(3433)
+
+cvCtrl <- trainControl(method = "repeatedcv", repeats = 5)
+
+grid <- expand.grid(mtry = seq(20, 40, by = 5))
+
+rfModel <- train(classe ~ ., data=classeNewTraining, method="rf",
+                 tuneGrid=grid,
+                 trControl = cvCtrl)
+
+rfModel
+```
+
+We get approximately 89% accuracy which is assumemd to be better than the actual accuracy we will
+see when the model is used for prediction with the testing data set.  Plotting the model will give
+a sesne of the how the value of the tuning parameter affected the model's accuracy.
+
+```{r, echo=FALSE}
+ggplot(rfModel) + theme(legend.position="top") + ggtitle("Random Forest Model Accuracy")
+```
+
+Thirty randomly selected predictors gives the best accuracy.  The next model we will train is also based
+upon trees but uses stochastic gradient boosting to improve accuracy.  As before we use 5 repetitions of
+10-fold cross validation.  The training process will also use a search grid that varies the tree depth,
+number of trees, and the learning rate.
+
+```{r cache = TRUE, message=FALSE}
+set.seed(3433)
+
+cvCtrl <- trainControl(method = "repeatedcv", repeats = 5)
+
+grid <- expand.grid(interaction.depth = seq(1, 7, by=2),
+                    n.trees = seq(150, 250, by = 50),
+                    shrinkage = c(0.1))
+
+gbmModel <- train(classe ~ ., data = classeNewTraining, method="gbm",
+                  tuneGrid=grid,
+                  verbose=F,
+                  trControl=cvCtrl)
+
+gbmModel
+```
+
+We get approximately 91% accuracy which is assuemd to be better than the actual accuracy we will
+see when the model is used for prediction with the testing data set.  Plotting the model will give
+a sesne of the how the various tuning parameters affected the model's accuracy.
+
+```{r, echo=FALSE}
+ggplot(gbmModel) + theme(legend.position="top")
+```
+
+Using a tree depth of 7 is a good choice and we might be able to increase the accuracy slightly by
+using deeper trees, but the curves indicate we're very close to the best accuracy that can be expected
+given the data and the model.
+
+Given that the two models are so close in terms of accuracy let's see how they compare to each other
+when making predictions for the withheld validation test data.
+
+```{r cache = TRUE}
+rfPredictions <- predict(rfModel, classeNewTesting)
+gbmPredictions <- predict(gbmModel, classeNewTesting)
+table(rfPredictions,gbmPredictions)
+```
+
+They are mostly in agreement.  Now we look at the Confusion matrix for the predictions made by the
+random forest model and the actual **classe** values from the validation test data set.
+
+```{r}
+confusionMatrix(rfPredictions, classeNewTesting$classe)
+```
+
+The models accuracy dropped to 83% which is likely due to being slightly overfit even though we
+used repeated n-fold cross validation in training.  Now we look at the confusion matrix for the
+predictions made by the GBM model and the actual values from the validation test data set.
+
+```{r}
+confusionMatrix(gbmPredictions, classeNewTesting$classe)
+```
+
+The models accuracy dropped to 86% which is also due to some overfitting.  However, the GBM model
+performs slightly better than the random forest model therefore it will be used to generate the
+predictions to be submitted for grading the assignment.  Predictions are made using the **newTesting**
+variable which contains the testing data read from the CSV file in the first part of this project.
+
+```{r message=FALSE}
+newTesting <- newTesting[order(newTesting$problem_id),]
+assignmentPredictions <- predict(gbmModel, newTesting)
+
+for (i in 1:length(assignmentPredictions)) {
+    filename = paste0("problem_id_", i, ".txt")
+    write.table(assignmentPredictions[i],
+                file=filename,
+                quote=F,
+                row.names=F,
+                col.names=F)
+}
+```
